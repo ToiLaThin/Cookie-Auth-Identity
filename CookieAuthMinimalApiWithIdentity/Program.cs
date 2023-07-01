@@ -139,6 +139,44 @@ app.MapGet("/logout", (HttpContext ctx,
     return "login required";
 
 });
+
+app.MapGet("/getCurrentUserInfo", (HttpContext ctx,
+                       IDataProtectionProvider idp,
+                       SessionService sessionService) =>
+{
+    var protector = idp.CreateProtector("auth-cookie");
+    var authDataWithName = ctx.Request.Headers.Cookie.FirstOrDefault(c => c.StartsWith("auth")); //phan code trung lap => chuyen sang dung middleware
+    if (authDataWithName != null) //check cookie if not valid => login required
+    {
+        
+        var authData = authDataWithName.Split("=").Last();
+        var payloadDecrypted = protector.Unprotect(authData);
+
+        //get session only and check if it's in cache
+        string sessionIdData = payloadDecrypted.Substring(payloadDecrypted.IndexOf("sessionId"));
+        string sessionId = sessionIdData.Split(":").Last();
+        if (sessionService.GetData<bool>(sessionId) == true) //which mean user is logged in
+        {
+            string[] datas = payloadDecrypted.Split("+");
+            List<string> types = new List<string>();
+            List<string> values = new List<string>();
+
+            foreach (string data in datas)
+            {
+                string[] parts = data.Split(":");
+                string type = parts[0];
+                string value = parts[1];
+                types.Add(type);
+                values.Add(value);
+            }
+            return types.ToString() + values.ToString();
+        }
+        else //session id expirered => delete cookie and login required
+            ctx.Response.Cookies.Delete("auth");
+    }
+    return "login required";
+
+});
 if (app.Environment.IsDevelopment())
 {
     app.UseSwagger();
