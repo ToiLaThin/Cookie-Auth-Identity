@@ -3,11 +3,13 @@ using CookieAuthMinimalApiWithIdentity.Helpers;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http;
 using Microsoft.EntityFrameworkCore;
+using Newtonsoft.Json;
 using System.Security.Claims;
 
 var builder = WebApplication.CreateBuilder(args);
-
+#region Configure Service in Dependency container
 var connStr = builder.Configuration.GetConnectionString("MyConnStr");
 builder.Services.AddDbContext<UserIdentityContext>(option =>
 {
@@ -34,8 +36,51 @@ builder.Services.Configure<IdentityOptions>(config =>
 });
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
+#endregion
 var app = builder.Build();
-app.MapGet("/init", (HttpContext ctx,RoleManager<IdentityRole> roleManager) => {
+
+#region Custom Middleware To Extract data from cookie
+app.Use((ctx, next) =>
+{
+    var idp = ctx.RequestServices.GetRequiredService<IDataProtectionProvider>();
+    var protector = idp.CreateProtector("auth-cookie");
+    var authDataWithName = ctx.Request.Headers.Cookie.FirstOrDefault(c => c.StartsWith("auth"));
+    if (authDataWithName != null) //check cookie if not valid => user not authenticated
+    {
+        var authData = authDataWithName.Split("=").Last();
+        var payloadDecrypted = protector.Unprotect(authData);
+        string[] datas = payloadDecrypted.Split("+"); //datas is keyvalue string[] formatlike key:value
+
+        var claims = new List<Claim>(); //convert datas into list of claims including session
+        foreach (string data in datas)
+        {
+            string[] parts = data.Split(":");
+            string type = parts[0];
+            string value = parts[1];
+            Claim newClaim = new Claim(type, value);
+            claims.Add(newClaim);
+        }
+
+        Claim? sessionClaim = claims.Find(c => c.Type == "sessionId");
+        string sessionId = sessionClaim.Value;
+        SessionService sessionService = ctx.RequestServices.GetRequiredService<SessionService>();
+        if (sessionService.GetData<bool>(sessionId) == true)
+        { //neu co session id trong cache => user da authenticated => tao claim principle va set identity.isAuthenticated = true
+            ClaimsIdentity identity = new ClaimsIdentity(claims);
+            ctx.User = new ClaimsPrincipal(identity); //authenticated mean have session id claim
+        }
+        else
+        {
+            //if session id expires and the cookie still store in browser => delete it
+            ctx.Response.Cookies.Delete("auth");
+        }
+    }
+    return next();
+});
+#endregion
+
+#region Endpoints
+app.MapGet("/init", (HttpContext ctx,RoleManager<IdentityRole> roleManager) => { //tao role user
     IdentityRole role = new IdentityRole("user");
     var result = roleManager.CreateAsync(role);
     if(result.Result.Succeeded) {
@@ -79,7 +124,12 @@ app.MapPost("/login",async (HttpContext ctx,
                        IDataProtectionProvider idp,
                        IHttpContextAccessor accessor) =>
 {
-    if(loginInfo != null)
+    Claim? sessionClaim = ctx.User?.Claims.FirstOrDefault(c => c.Type == "sessionId");
+    if (sessionClaim != null)
+    {
+        return "already logged in";
+    }
+    if(loginInfo != null) //not logged in
     {
         var result = signInManager.PasswordSignInAsync(loginInfo.Username, loginInfo.Password, false, false);
         if(result.Result.Succeeded)
@@ -90,10 +140,11 @@ app.MapPost("/login",async (HttpContext ctx,
             var claims = (await userManager.GetClaimsAsync(signedInUser)).ToList(); //var claims = ctx.User.Claims.ToList();
 
             //got claims and session id now save it to cache and set cookie
-            sessionService.SetData(sessionId.ToString(), true , DateTime.Now.AddMinutes(5));
+            sessionService.SetData(sessionId.ToString(), true , DateTime.Now.AddMinutes(1));
             string userData = String.Empty;
             foreach(var claim in claims) {
-                userData += $"{claim.Type}:{claim.Value}+";
+                int lastIdxOfChar = claim.Type.LastIndexOf("/");
+                userData += $"{claim.Type.Substring(lastIdxOfChar + 1)}:{claim.Value}+";
             }
             string finalDataToProtect = $"{userData}sessionId:{sessionId}";
             accessor.HttpContext.Response.Headers["set-cookie"] = $"auth={protector.Protect(finalDataToProtect)}";
@@ -104,79 +155,37 @@ app.MapPost("/login",async (HttpContext ctx,
 });
 
 app.MapGet("/logout", (HttpContext ctx,
-                       IDataProtectionProvider idp,
                        SessionService sessionService) =>
 {
-    var protector = idp.CreateProtector("auth-cookie");
-    var authDataWithName = ctx.Request.Headers.Cookie.FirstOrDefault(c => c.StartsWith("auth"));
-    if (authDataWithName != null) //check cookie if not valid => login required
+    Claim? sessionClaim = ctx.User?.Claims.FirstOrDefault(c => c.Type == "sessionId");
+    if (sessionClaim != null)
     {
-        var authData = authDataWithName.Split("=").Last();
-        var payloadDecrypted = protector.Unprotect(authData);
-        //string[] datas = payloadDecrypted.Split("+");
-        //List<string> types = new List<string>();
-        //List<string> values = new List<string>();
-
-        //foreach(string data in datas)
-        //{
-        //    string[] parts = data.Split(":");
-        //    string type = parts[0];
-        //    string value = parts[1];
-        //    types.Add(type); 
-        //    types.Add(value);
-        //}
-
-        //get session only and check if it's in cache
-        string sessionIdData = payloadDecrypted.Substring(payloadDecrypted.IndexOf("sessionId"));
-        string sessionId = sessionIdData.Split(":").Last();
-        if(sessionService.GetData<bool>(sessionId) == true)
-        {
-            sessionService.RemoveData(sessionId);
-        }
+        string sessionId = sessionClaim.Value;
+        sessionService.RemoveData(sessionId);
         ctx.Response.Cookies.Delete("auth");
         return "logged out";
+
     }
     return "login required";
 
 });
 
-app.MapGet("/getCurrentUserInfo", (HttpContext ctx,
-                       IDataProtectionProvider idp,
-                       SessionService sessionService) =>
+app.MapGet("/getCurrentUserInfo", (HttpContext ctx, SessionService sessionService) =>
 {
-    var protector = idp.CreateProtector("auth-cookie");
-    var authDataWithName = ctx.Request.Headers.Cookie.FirstOrDefault(c => c.StartsWith("auth")); //phan code trung lap => chuyen sang dung middleware
-    if (authDataWithName != null) //check cookie if not valid => login required
+    Claim? sessionClaim = ctx.User?.Claims.FirstOrDefault(c => c.Type == "sessionId");
+    if (sessionClaim != null)
     {
-        
-        var authData = authDataWithName.Split("=").Last();
-        var payloadDecrypted = protector.Unprotect(authData);
-
-        //get session only and check if it's in cache
-        string sessionIdData = payloadDecrypted.Substring(payloadDecrypted.IndexOf("sessionId"));
-        string sessionId = sessionIdData.Split(":").Last();
-        if (sessionService.GetData<bool>(sessionId) == true) //which mean user is logged in
+        string result = String.Empty;
+        foreach(var claim in ctx.User.Claims)
         {
-            string[] datas = payloadDecrypted.Split("+");
-            List<string> types = new List<string>();
-            List<string> values = new List<string>();
-
-            foreach (string data in datas)
-            {
-                string[] parts = data.Split(":");
-                string type = parts[0];
-                string value = parts[1];
-                types.Add(type);
-                values.Add(value);
-            }
-            return types.ToString() + values.ToString();
+            result += $"{claim.Type}:{claim.Value}\n";
         }
-        else //session id expirered => delete cookie and login required
-            ctx.Response.Cookies.Delete("auth");
+        return result;
     }
-    return "login required";
-
+    return "login required"; //in the middleware the cookie will be set to delete already
 });
+#endregion
+
 if (app.Environment.IsDevelopment())
 {
     app.UseSwagger();
